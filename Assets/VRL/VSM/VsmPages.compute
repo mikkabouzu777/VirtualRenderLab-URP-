@@ -1,0 +1,245 @@
+// VSM のページ管理(持ち越しあり)。1 コマの流れ:
+//  ClearRequests → MarkFromDepth(深度から要るページに印)→ UpdatePages(窓から外れた・長く使っていないページを空きへ戻す / 要るのに無いページを並べる)
+//  → Allocate(空きのマスを配る)→ FinishAlloc → InvalidateDynamic(動いた物に掛かるマスを描き直しへ)
+//  → CullCasterPages(描き直すマスに掛かる物ごとに並べる)→ WriteClearArgs → DrawViz
+// InitAll は最初と、光の向きや奥行きの基準が変わった時だけ(全部捨てる)。
+#pragma kernel InitAll
+#pragma kernel ClearRequests
+#pragma kernel MarkFromDepth
+#pragma kernel UpdatePages
+#pragma kernel Allocate
+#pragma kernel FinishAlloc
+#pragma kernel InvalidateDynamic
+#pragma kernel CullCasterPages
+#pragma kernel WriteClearArgs
+#pragma kernel DrawViz
+
+#include "VsmCommon.hlsl"
+
+RWStructuredBuffer<uint> _Requests;
+RWStructuredBuffer<uint2> _PageTableRW;  // 表の場所 → (物理のマス+1, abs)
+RWStructuredBuffer<uint4> _SlotInfoRW;   // 物理のマス → (表の場所, abs, 最後に使ったコマ, 最後に描き直したコマ)
+RWStructuredBuffer<uint> _FreeStack;
+RWStructuredBuffer<uint> _AllocList;
+RWStructuredBuffer<uint> _RenderList;
+// +0 割り当て待ち +4 要る印の数 +8 空きの数(持ち越す) +12 描き直すマスの数 +16 置けなかった数 +20 前のコマから持ち越した数
+RWByteAddressBuffer _Counter;
+RWByteAddressBuffer _CasterArgs;        // 物ごとに 5 uint。+4 が instanceCount
+RWByteAddressBuffer _ClearArgs;         // DrawProceduralIndirect の 4 uint
+RWStructuredBuffer<uint> _CasterPagesRW; // 物 c の i 番目に描くマス = [c * _MaxPhys + i]
+StructuredBuffer<float4> _CasterSpheres;
+StructuredBuffer<float4> _DirtySpheres;  // 動いた物の前と今の外接球
+RWTexture2D<float4> _Viz;
+
+Texture2D<float> _CameraDepth;
+float4x4 _InvViewProj;
+float4 _DepthSize;          // xy=画素数 z=上下反転(1=D3D)
+uint _TotalEntries;
+uint _MaxPhys;
+uint _CasterCount;
+uint _DirtyCount;
+uint _KeepFrames;           // 要らなくなってから何コマ残すか
+uint _Frame;
+
+[numthreads(64, 1, 1)]
+void InitAll(uint id : SV_DispatchThreadID)
+{
+    if (id < _TotalEntries) { _PageTableRW[id].x = 0; _PageTableRW[id].y = 0; }
+    if (id < _MaxPhys)
+    {
+        _FreeStack[id] = _MaxPhys - 1 - id;
+        _SlotInfoRW[id].x = VSM_NONE;
+        _SlotInfoRW[id].z = 0;
+        _SlotInfoRW[id].w = 0;
+    }
+    if (id == 0) _Counter.Store(8, _MaxPhys);
+}
+
+[numthreads(64, 1, 1)]
+void ClearRequests(uint id : SV_DispatchThreadID)
+{
+    if (id < _TotalEntries) _Requests[id] = 0;
+    if (id == 0) { _Counter.Store(0, 0); _Counter.Store(4, 0); _Counter.Store(12, 0); _Counter.Store(16, 0); _Counter.Store(20, 0); }
+    if (id < _CasterCount) _CasterArgs.Store(id * 20 + 4, 0);
+}
+
+[numthreads(8, 8, 1)]
+void MarkFromDepth(uint2 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint2)_DepthSize.xy)) return;
+    float d = _CameraDepth.Load(int3(id, 0));
+#if UNITY_REVERSED_Z
+    if (d <= 0.0) return;
+#else
+    if (d >= 1.0) return;
+#endif
+    float2 v = (id + 0.5) / _DepthSize.xy;
+    float2 ndc = float2(v.x * 2 - 1, _DepthSize.z > 0.5 ? 1 - v.y * 2 : v.y * 2 - 1);
+    float4 w = mul(_InvViewProj, float4(ndc, d, 1));
+    float3 posWS = w.xyz / w.w;
+
+    float3 ls = mul(_VsmLightView, float4(posWS, 1)).xyz;
+    int level = VsmLevelFor(posWS);
+    int2 absP = (int2)floor(VsmPageCoord(ls, level));
+    if (!VsmInWindow(absP, level)) return;
+    _Requests[VsmEntry(level, absP)] = 1;
+}
+
+void FreeSlot(uint slot)
+{
+    uint idx;
+    _Counter.InterlockedAdd(8, 1, idx);
+    _FreeStack[idx] = slot;
+}
+
+[numthreads(64, 1, 1)]
+void UpdatePages(uint e : SV_DispatchThreadID)
+{
+    if (e >= _TotalEntries) return;
+    int level;
+    int2 absP = VsmAbsOfEntry(e, level);
+    uint packed = VsmPackAbs(absP);
+    bool req = _Requests[e] != 0;
+    if (req) _Counter.InterlockedAdd(4, 1);
+
+    uint s1 = _PageTableRW[e].x;
+    if (s1 != 0)
+    {
+        uint slot = s1 - 1;
+        bool stale = _PageTableRW[e].y != packed;    // 窓が動いて、ここは別のページの場所になった
+        bool expired = !req && (_Frame - _SlotInfoRW[slot].z) > _KeepFrames;
+        if (stale || expired)
+        {
+            _PageTableRW[e].x = 0;
+            FreeSlot(slot);
+            s1 = 0;
+        }
+        else if (req)
+        {
+            _SlotInfoRW[slot].z = _Frame;
+            _Counter.InterlockedAdd(20, 1);
+        }
+    }
+    if (s1 == 0 && req)
+    {
+        uint i;
+        _Counter.InterlockedAdd(0, 1, i);
+        _AllocList[i] = e;
+    }
+}
+
+void PushRender(uint slot)
+{
+    uint r;
+    _Counter.InterlockedAdd(12, 1, r);
+    _RenderList[r] = slot;
+}
+
+[numthreads(64, 1, 1)]
+void Allocate(uint i : SV_DispatchThreadID)
+{
+    if (i >= _Counter.Load(0)) return;
+    uint fc = _Counter.Load(8);
+    if (i >= fc) { _Counter.InterlockedAdd(16, 1); return; }
+    uint slot = _FreeStack[fc - 1 - i];
+    uint e = _AllocList[i];
+    int level;
+    uint packed = VsmPackAbs(VsmAbsOfEntry(e, level));
+    _PageTableRW[e].x = slot + 1;
+    _PageTableRW[e].y = packed;
+    _SlotInfoRW[slot].x = e;
+    _SlotInfoRW[slot].y = packed;
+    _SlotInfoRW[slot].z = _Frame;
+    _SlotInfoRW[slot].w = _Frame;
+    PushRender(slot);
+}
+
+[numthreads(1, 1, 1)]
+void FinishAlloc(uint id : SV_DispatchThreadID)
+{
+    uint fc = _Counter.Load(8);
+    uint n = _Counter.Load(0);
+    _Counter.Store(8, fc - min(n, fc));
+}
+
+bool SphereOverlapsSlot(float4 sph, uint slot, out int level)
+{
+    uint e = _SlotInfoRW[slot].x;
+    level = (int)(e / VSM_PAGES_PER_LEVEL);
+    float2 absP = (float2)VsmUnpackAbs(_SlotInfoRW[slot].y);
+    float3 ls = mul(_VsmLightView, float4(sph.xyz, 1)).xyz;
+    float2 p = VsmPageCoord(ls, level) - absP;
+    float r = sph.w / _VsmOrigins[level].w;
+    if (any(p + r < 0) || any(p - r > 1)) return false;
+    // 光の奥行きの範囲より奥(受ける物が無い)なら描かない
+    if (VsmDepth01(ls) - sph.w * _VsmZ.y > 1) return false;
+    return true;
+}
+
+bool SlotAlive(uint slot)
+{
+    uint e = _SlotInfoRW[slot].x;
+    return e != VSM_NONE && _PageTableRW[e].x == slot + 1;
+}
+
+[numthreads(64, 1, 1)]
+void InvalidateDynamic(uint slot : SV_DispatchThreadID)
+{
+    if (slot >= _MaxPhys || _DirtyCount == 0 || !SlotAlive(slot)) return;
+    if (_SlotInfoRW[slot].w == _Frame) return;
+    int level;
+    for (uint i = 0; i < _DirtyCount; i++)
+    {
+        if (SphereOverlapsSlot(_DirtySpheres[i], slot, level))
+        {
+            _SlotInfoRW[slot].w = _Frame;
+            PushRender(slot);
+            return;
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CullCasterPages(uint3 id : SV_DispatchThreadID)
+{
+    uint ri = id.x, caster = id.y;
+    if (caster >= _CasterCount || ri >= _Counter.Load(12)) return;
+    uint slot = _RenderList[ri];
+    int level;
+    if (!SphereOverlapsSlot(_CasterSpheres[caster], slot, level)) return;
+    uint idx;
+    _CasterArgs.InterlockedAdd(caster * 20 + 4, 1, idx);
+    _CasterPagesRW[caster * _MaxPhys + idx] = slot;
+}
+
+[numthreads(1, 1, 1)]
+void WriteClearArgs(uint id : SV_DispatchThreadID)
+{
+    _ClearArgs.Store(0, 6);
+    _ClearArgs.Store(4, _Counter.Load(12));
+    _ClearArgs.Store(8, 0);
+    _ClearArgs.Store(12, 0);
+}
+
+// ページ表の絵: 5 列 x 2 段にレベルを並べる。窓の中心を真ん中に。白=このコマ描き直した 色=持ち越し 暗い灰=要ったが置けなかった
+[numthreads(8, 8, 1)]
+void DrawViz(uint2 id : SV_DispatchThreadID)
+{
+    uint level = (id.x / VSM_PAGES) + (id.y / VSM_PAGES) * 5;
+    int2 local = int2(id % VSM_PAGES) - VSM_PAGES / 2;
+    float4 c = float4(0.05, 0.05, 0.06, 1);
+    if (level < (uint)VsmLevelCount())
+    {
+        int2 absP = (int2)_VsmOrigins[level].xy + local;
+        uint e = VsmEntry(level, absP);
+        uint s = _PageTableRW[e].x;
+        if (s != 0 && _PageTableRW[e].y == VsmPackAbs(absP))
+        {
+            c.rgb = lerp(VsmHash(s), VsmLevelColor(level), 0.35) * 0.8;
+            if (_SlotInfoRW[s - 1].w == _Frame) c.rgb = 1;
+        }
+        else if (_Requests[e] != 0) c.rgb = 0.3;
+        if (local.x == -VSM_PAGES / 2 || local.y == -VSM_PAGES / 2) c.rgb = float3(0.3, 0.3, 0.35);
+    }
+    _Viz[uint2(id.x, VSM_PAGES * 2 - 1 - id.y)] = c;
+}

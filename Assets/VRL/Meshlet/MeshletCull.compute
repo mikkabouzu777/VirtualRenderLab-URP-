@@ -1,0 +1,474 @@
+// Meshlet の外し方。
+//  CullInstances / WriteMainArgs : 物ごとに視錐台で外し、その物の距離の幅から「切り口に入りうる DAG の段」だけを (物, 段) として並べる
+//             (全部の塊 x 全部の物を調べずに済ませる。Nanite は塊の木(BVH)で絞るが、ここは物 → 段の 2 段で絞る)
+//  CullMain : 前のコマの深度ピラミッド(Hi-Z)で外す 1 回目。DAG の切り口(自分の誤差は目標以下・親は目標より大きい)→ 視錐台 → 裏向き → Hi-Z。
+//             Hi-Z で隠れていた塊は _Occluded へ(2 回目でもう一度調べる)
+//  CullPost : このコマの深度(1 回目で描いた物+地形など)から作った Hi-Z で、隠れていた塊をもう一度調べる 2 回目
+//  HzbFromDepth / HzbReduce : 深度から Hi-Z(各マスで一番遠い距離)を作る
+//  ShadowPages / ShadowArgs / ShadowClusters / ShadowFinish : VSM の描き直すページごとに、掛かる岩の塊だけを、ページの細かさに合う段で選ぶ
+#pragma kernel CullInstances
+#pragma kernel WriteMainArgs
+#pragma kernel CullMain
+#pragma kernel CullPost
+#pragma kernel WritePostArgs
+#pragma kernel HzbFromDepth
+#pragma kernel HzbReduce
+#pragma kernel ShadowPages
+#pragma kernel ShadowArgs
+#pragma kernel ShadowClusters
+#pragma kernel ShadowFinish
+#pragma kernel WriteSwArgs
+#pragma kernel WriteSwDrawArgs
+#pragma kernel SwClear
+#pragma kernel SwRasterDepth
+#pragma kernel SwRasterPayload
+
+#include "Assets/VRL/VSM/VsmCommon.hlsl"
+
+struct MeshletGpu
+{
+    float4 sphere; float4 cone; float4 selfLod; float4 parentLod;
+    uint triOffset; uint triCount; uint lod; uint group;
+    float selfErr; float parentErr; float pad0; float pad1;
+};
+struct InstanceGpu { float4x4 m; float4 extra; }; // extra.x = 一様スケール
+struct LevelInfo { uint start; uint count; float minSelfErr; float maxParentErr; };
+
+StructuredBuffer<MeshletGpu> _Meshlets;
+StructuredBuffer<InstanceGpu> _Instances;
+StructuredBuffer<LevelInfo> _Levels;
+RWStructuredBuffer<uint2> _Visible;     // 1 回目で描く (物, 塊)
+RWStructuredBuffer<uint2> _Visible2;    // 2 回目で描く
+RWStructuredBuffer<uint2> _Occluded;    // 1 回目で Hi-Z に隠れていた
+RWByteAddressBuffer _Args;              // 1 回目の RenderPrimitivesIndirect。+4 が instanceCount
+RWByteAddressBuffer _Args2;             // 2 回目
+RWStructuredBuffer<uint2> _Work;        // (物, 段)
+RWStructuredBuffer<uint2> _SwList;      // ソフトウェアラスタで塗る (物, 塊)
+RWByteAddressBuffer _Dispatch;          // +0 2 回目 +12 影 +24 1 回目(物, 段) +36 ソフトウェアラスタ の DispatchIndirect
+// +0 三角形(1 回目・ハード) +4 外した: 視錐台 +8 裏向き +12 1 回目で隠れていた数 +16 三角形(2 回目) +20 -
+// +24 影: (岩, ページ) の数 +28 影: 三角形 +32 影: 置けなかった
+// +36 (物, 段) の数 +40 調べた塊の数 +44 ソフトウェアラスタの塊 +48 その三角形
+RWByteAddressBuffer _Stats;
+
+float4 _Planes[6];
+float3 _CamPos;
+float _PxScale;     // 2*tan(fov/2)/画面の高さ = 距離 1m で 1 ピクセルの大きさ
+float _ErrorPx;     // 誤差がこのピクセル数以下の一番粗い塊を選ぶ
+int _ForceLevel;    // -1 で自動
+int _ConeCull;
+int _UseHzb;
+int _DebugAllToPost;  // 検証用: 1 回目で全部を「隠れた」扱いにして 2 回目だけで描く
+uint _InstanceCount;
+uint _TotalClusters;
+uint _MaxVisible;
+uint _LevelCount;
+int _SwRaster;      // 1 = 画面で小さい塊は compute で塗る
+float _SwMaxPx;     // 塊の球の半径がこのピクセル数より小さければソフトウェアラスタ
+float _NearClip;
+float4 _MeshSphere; // 物体座標での全体の球
+
+// ---- Hi-Z ----
+Texture2D<float> _Hzb;
+RWTexture2D<float> _HzbRW;
+float4 _HzbInfo;        // x,y = 段 0 の大きさ z = 段の数
+float4 _HzbMips[16];    // xy = 置き場の左下 zw = 大きさ
+float4x4 _HzbVP;        // Hi-Z を作った時の(GL の向きの)ビュー x 射影
+float4 _HzbCamPos;      // xyz w=近い面
+float4 _HzbCamFwd;
+float4 _HzbDst, _HzbSrc;
+Texture2D<float> _DepthTex;
+float4 _DepthInfo;      // xy = 深度の画素数
+float4 _ZParams;        // _ZBufferParams と同じ
+
+bool SphereVisible(float3 c, float r)
+{
+    [unroll] for (int i = 0; i < 6; i++)
+        if (dot(_Planes[i].xyz, c) + _Planes[i].w < -r) return false;
+    return true;
+}
+
+// 画面での誤差(ピクセル)。球に一番近い所までの距離で割る
+float ProjectedError(float4 lodSphere, float err, InstanceGpu I, float s)
+{
+    float3 c = mul(I.m, float4(lodSphere.xyz, 1)).xyz;
+    float d = max(distance(c, _CamPos) - lodSphere.w * s, 0.05);
+    return err * s / (d * _PxScale);
+}
+
+// 球が Hi-Z の一番遠い深度より手前にあるか(見えるかもしれない)
+bool HzbVisible(float3 c, float r)
+{
+    float zNear = dot(c - _HzbCamPos.xyz, _HzbCamFwd.xyz) - r;
+    if (zNear <= _HzbCamPos.w * 2) return true;
+    float2 mn = 1e9, mx = -1e9;
+    [unroll] for (int i = 0; i < 8; i++)
+    {
+        float3 p = c + r * float3((i & 1) ? 1 : -1, (i & 2) ? 1 : -1, (i & 4) ? 1 : -1);
+        float4 cp = mul(_HzbVP, float4(p, 1));
+        if (cp.w <= 1e-4) return true;
+        float2 ndc = cp.xy / cp.w;
+        mn = min(mn, ndc); mx = max(mx, ndc);
+    }
+    // 画面の外へはみ出す物は、はみ出した所の深度を知らないので見える扱い
+    if (any(mn < -1) || any(mx > 1)) return true;
+    float2 uvMin = mn * 0.5 + 0.5, uvMax = mx * 0.5 + 0.5;
+    float2 sz = (uvMax - uvMin) * _HzbInfo.xy;
+    int last = (int)_HzbInfo.z - 1;
+    int mip = clamp((int)ceil(log2(max(max(sz.x, sz.y), 1))), 0, last);
+    int2 lo = 0, hi = 0;
+    [loop] for (int k = 0; k < 3; k++)
+    {
+        float2 s = _HzbMips[mip].zw;
+        lo = (int2)floor(uvMin * s);
+        hi = min((int2)floor(uvMax * s), (int2)s - 1);
+        if (all(hi - lo <= 1) || mip >= last) break;
+        mip++;
+    }
+    int2 off = (int2)_HzbMips[mip].xy;
+    float far = 0;
+    [loop] for (int y = lo.y; y <= hi.y; y++)
+        [loop] for (int x = lo.x; x <= hi.x; x++)
+            far = max(far, _Hzb.Load(int3(off + int2(x, y), 0)));
+    return zNear <= far;
+}
+
+// 物ごと: 視錐台、そして切り口に入りうる段を選ぶ。
+// 塊の誤差の球は物の球の中にあるので、物の球までの距離の幅 [dMin, dMax] で、段の誤差の幅が切り口をまたぐかを見られる
+[numthreads(64, 1, 1)]
+void CullInstances(uint3 id : SV_DispatchThreadID)
+{
+    uint inst = id.x;
+    if (inst >= _InstanceCount) return;
+    InstanceGpu I = _Instances[inst];
+    float s = I.extra.x;
+    float3 c = mul(I.m, float4(_MeshSphere.xyz, 1)).xyz;
+    float r = _MeshSphere.w * s;
+    if (!SphereVisible(c, r)) return;
+    float dist = distance(c, _CamPos);
+    float dMin = max(dist - r, 0.05), dMax = dist + r;
+    for (uint L = 0; L < _LevelCount; L++)
+    {
+        LevelInfo li = _Levels[L];
+        if (_ForceLevel >= 0)
+        {
+            if ((int)L > _ForceLevel) continue;
+        }
+        else
+        {
+            // 一番細かい塊でも遠い側で目標を超える → この段は粗すぎる
+            if (li.minSelfErr * s / (dMax * _PxScale) > _ErrorPx) continue;
+            // 一番粗い親でも近い側で目標以下 → 親の段で足りる
+            if (li.maxParentErr * s / (dMin * _PxScale) <= _ErrorPx) continue;
+        }
+        uint w;
+        _Stats.InterlockedAdd(36, 1, w);
+        _Work[w] = uint2(inst, L);
+        _Stats.InterlockedAdd(40, li.count);
+    }
+}
+
+[numthreads(1, 1, 1)]
+void WriteMainArgs(uint3 id : SV_DispatchThreadID)
+{
+    _Dispatch.Store(24, min(_Stats.Load(36), 65535u));
+    _Dispatch.Store(28, 1);
+    _Dispatch.Store(32, 1);
+}
+
+void TestCluster(uint inst, uint ci, InstanceGpu I, float s)
+{
+    MeshletGpu m = _Meshlets[ci];
+    if (_ForceLevel >= 0)
+    {
+        bool isRoot = m.parentErr > 1e29;
+        if (!((int)m.lod == _ForceLevel || (isRoot && (int)m.lod < _ForceLevel))) return;
+    }
+    else
+    {
+        // DAG の切り口: 自分は十分細かい かつ 親は粗すぎる
+        if (ProjectedError(m.selfLod, m.selfErr, I, s) > _ErrorPx) return;
+        if (ProjectedError(m.parentLod, m.parentErr, I, s) <= _ErrorPx) return;
+    }
+
+    float3 mc = mul(I.m, float4(m.sphere.xyz, 1)).xyz;
+    float mr = m.sphere.w * s;
+    if (!SphereVisible(mc, mr)) { _Stats.InterlockedAdd(4, 1); return; }
+
+    if (_ConeCull != 0 && m.cone.w < 1.0)
+    {
+        float3 axis = normalize(mul((float3x3)I.m, m.cone.xyz));
+        float3 d = mc - _CamPos;
+        if (dot(d, axis) >= m.cone.w * length(d) + mr) { _Stats.InterlockedAdd(8, 1); return; }
+    }
+
+    if (_UseHzb != 0 && (_DebugAllToPost != 0 || !HzbVisible(mc, mr)))
+    {
+        uint o;
+        _Stats.InterlockedAdd(12, 1, o);
+        if (o < _MaxVisible) _Occluded[o] = uint2(inst, ci);
+        return;
+    }
+
+    // 画面で小さい塊はソフトウェアラスタへ(近い面より手前にかからない物だけ)
+    float dist = distance(mc, _CamPos);
+    if (_SwRaster != 0 && dist - mr > _NearClip * 4 && mr / ((dist - mr) * _PxScale) < _SwMaxPx)
+    {
+        uint w;
+        _Stats.InterlockedAdd(44, 1, w);
+        if (w < _MaxVisible) { _SwList[w] = uint2(inst, ci); _Stats.InterlockedAdd(48, m.triCount); }
+        return;
+    }
+
+    uint slot;
+    _Args.InterlockedAdd(4, 1, slot);
+    if (slot >= _MaxVisible) return;
+    _Visible[slot] = uint2(inst, ci);
+    _Stats.InterlockedAdd(0, m.triCount);
+}
+
+// 1 グループ = (物, 段) 1 つ。その段の塊を 64 スレッドで手分けして調べる
+[numthreads(64, 1, 1)]
+void CullMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint2 wk = _Work[gid.x];
+    InstanceGpu I = _Instances[wk.x];
+    float s = I.extra.x;
+    LevelInfo li = _Levels[wk.y];
+    for (uint i = gtid.x; i < li.count; i += 64)
+        TestCluster(wk.x, li.start + i, I, s);
+}
+
+[numthreads(1, 1, 1)]
+void WritePostArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint n = min(_Stats.Load(12), _MaxVisible);
+    _Dispatch.Store(0, (n + 63) / 64);
+    _Dispatch.Store(4, 1);
+    _Dispatch.Store(8, 1);
+}
+
+[numthreads(64, 1, 1)]
+void CullPost(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= min(_Stats.Load(12), _MaxVisible)) return;
+    uint2 e = _Occluded[i];
+    InstanceGpu I = _Instances[e.x];
+    MeshletGpu m = _Meshlets[e.y];
+    float3 mc = mul(I.m, float4(m.sphere.xyz, 1)).xyz;
+    if (!HzbVisible(mc, m.sphere.w * I.extra.x)) return;
+    uint slot;
+    _Args2.InterlockedAdd(4, 1, slot);
+    if (slot >= _MaxVisible) return;
+    _Visible2[slot] = e;
+    _Stats.InterlockedAdd(16, m.triCount);
+}
+
+// ---- Hi-Z を作る。段 0 の 1 マスは深度の 1〜3 画素四方ぶん。値は目からの距離(一番遠い物) ----
+[numthreads(8, 8, 1)]
+void HzbFromDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint2)_HzbDst.zw)) return;
+    float2 scale = _DepthInfo.xy / _HzbDst.zw;
+    int2 p0 = (int2)floor(id.xy * scale);
+    int2 p1 = min((int2)ceil((id.xy + 1) * scale), (int2)_DepthInfo.xy) - 1;
+    float far = 0;
+    [loop] for (int y = p0.y; y <= p1.y; y++)
+        [loop] for (int x = p0.x; x <= p1.x; x++)
+        {
+            float d = _DepthTex.Load(int3(x, y, 0));
+            far = max(far, 1.0 / (_ZParams.z * d + _ZParams.w));
+        }
+    _HzbRW[(int2)_HzbDst.xy + (int2)id.xy] = far;
+}
+
+[numthreads(8, 8, 1)]
+void HzbReduce(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint2)_HzbDst.zw)) return;
+    int2 s = (int2)id.xy * 2;
+    int2 smax = (int2)_HzbSrc.zw - 1;
+    int2 o = (int2)_HzbSrc.xy;
+    float a = _HzbRW[o + min(s, smax)];
+    float b = _HzbRW[o + min(s + int2(1, 0), smax)];
+    float c = _HzbRW[o + min(s + int2(0, 1), smax)];
+    float d = _HzbRW[o + min(s + int2(1, 1), smax)];
+    _HzbRW[(int2)_HzbDst.xy + (int2)id.xy] = max(max(a, b), max(c, d));
+}
+
+// ---- VSM: 岩の影を塊単位で ----
+StructuredBuffer<uint> _VsmRenderList;  // このコマ描き直す物理のマス
+ByteAddressBuffer _VsmCounter;          // +12 描き直すマスの数
+RWStructuredBuffer<uint2> _ShadowWork;  // (岩, マス)
+RWStructuredBuffer<uint4> _ShadowDraw;  // (岩, 塊, マス, -)
+RWByteAddressBuffer _ShadowArgs;        // DrawProceduralIndirect。+4 が instanceCount
+uint _MaxShadowWork;
+uint _MaxShadowDraw;
+float _ShadowErrTexels;                 // 影の 1 画素の何倍までの誤差を許すか
+
+bool SphereOverlapsSlot(float3 c, float r, uint slot, out int level)
+{
+    uint4 si = _VsmSlotInfo[slot];
+    level = (int)(si.x / VSM_PAGES_PER_LEVEL);
+    float2 absP = (float2)VsmUnpackAbs(si.y);
+    float3 ls = mul(_VsmLightView, float4(c, 1)).xyz;
+    float2 p = VsmPageCoord(ls, level) - absP;
+    float rp = r / _VsmOrigins[level].w;
+    if (any(p + rp < 0) || any(p - rp > 1)) return false;
+    if (VsmDepth01(ls) - r * _VsmZ.y > 1) return false;
+    return true;
+}
+
+[numthreads(64, 1, 1)]
+void ShadowPages(uint3 id : SV_DispatchThreadID)
+{
+    uint ri = id.x, inst = id.y;
+    if (inst >= _InstanceCount || ri >= _VsmCounter.Load(12)) return;
+    uint slot = _VsmRenderList[ri];
+    InstanceGpu I = _Instances[inst];
+    int level;
+    if (!SphereOverlapsSlot(mul(I.m, float4(_MeshSphere.xyz, 1)).xyz, _MeshSphere.w * I.extra.x, slot, level)) return;
+    uint w;
+    _Stats.InterlockedAdd(24, 1, w);
+    if (w < _MaxShadowWork) _ShadowWork[w] = uint2(inst, slot);
+}
+
+[numthreads(1, 1, 1)]
+void ShadowArgs(uint3 id : SV_DispatchThreadID)
+{
+    _Dispatch.Store(12, min(_Stats.Load(24), _MaxShadowWork));
+    _Dispatch.Store(16, 1);
+    _Dispatch.Store(20, 1);
+}
+
+// 1 グループ = (岩, マス) 1 つ。そのマスの 1 画素に合う段の塊のうち、マスに掛かる物だけ並べる
+[numthreads(64, 1, 1)]
+void ShadowClusters(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint w = gid.x;
+    uint2 wk = _ShadowWork[w];
+    InstanceGpu I = _Instances[wk.x];
+    float s = I.extra.x;
+    uint slot = wk.y;
+    uint level = _VsmSlotInfo[slot].x / VSM_PAGES_PER_LEVEL;
+    float thr = _VsmOrigins[level].w / VSM_PAGE_PX * _ShadowErrTexels / s; // 物体座標での許せる誤差
+
+    for (uint L = 0; L < _LevelCount; L++)
+    {
+        LevelInfo li = _Levels[L];
+        if (li.minSelfErr > thr || li.maxParentErr <= thr) continue;
+        for (uint i = gtid.x; i < li.count; i += 64)
+        {
+            uint ci = li.start + i;
+            MeshletGpu m = _Meshlets[ci];
+            if (m.selfErr > thr || m.parentErr <= thr) continue;
+            int lv;
+            if (!SphereOverlapsSlot(mul(I.m, float4(m.sphere.xyz, 1)).xyz, m.sphere.w * s, slot, lv)) continue;
+            uint d;
+            _ShadowArgs.InterlockedAdd(4, 1, d);
+            if (d >= _MaxShadowDraw) { _Stats.InterlockedAdd(32, 1); continue; }
+            _ShadowDraw[d] = uint4(wk.x, ci, slot, 0);
+            _Stats.InterlockedAdd(28, m.triCount);
+        }
+    }
+}
+
+[numthreads(1, 1, 1)]
+void ShadowFinish(uint3 id : SV_DispatchThreadID)
+{
+    _ShadowArgs.Store(4, min(_ShadowArgs.Load(4), _MaxShadowDraw));
+}
+
+// ---- ソフトウェアラスタ: 画面で小さい塊の三角形を compute で塗る ----
+// 1 回目: 深度だけ InterlockedMax(近いほど大きい値)。2 回目: 深度が一致した画素に (塊の番号, 三角形) を書く。
+// 画素の行は深度テクスチャと同じ並び。色付けは MeshletLit の SwResolve(全画面)で、深度は SwDepth で深度テクスチャへ。
+RWStructuredBuffer<uint> _SwDepth;
+RWStructuredBuffer<uint> _SwPayload;
+float4x4 _SwVP;                         // GPU 向けのビュー x 射影(テクスチャへ描く向き)
+float4 _SwScreen;                       // xy=画素数 z=上下反転(1=D3D) w=reversed-Z
+float _SwCullSign;
+struct Vtx { float3 pos; float3 nrm; };
+StructuredBuffer<Vtx> _Vertices;
+StructuredBuffer<uint> _Indices;
+
+[numthreads(1, 1, 1)]
+void WriteSwArgs(uint3 id : SV_DispatchThreadID)
+{
+    // 1 グループ = 1 塊。グループ数の上限 65535 を超えるので 2 次元に並べる(x 65535 まで、y はその段数)
+    uint n = min(_Stats.Load(44), _MaxVisible);
+    _Dispatch.Store(36, min(n, 65535u));
+    _Dispatch.Store(40, max((n + 65534) / 65535, 1u));
+    _Dispatch.Store(44, 1);
+}
+
+// URP の普通の影(VSM が無い時)へ、ソフトウェアラスタの塊も影だけ描くための RenderPrimitivesIndirect の数
+RWByteAddressBuffer _SwDrawArgs;
+[numthreads(1, 1, 1)]
+void WriteSwDrawArgs(uint3 id : SV_DispatchThreadID)
+{
+    _SwDrawArgs.Store(4, min(_Stats.Load(44), _MaxVisible));
+}
+
+[numthreads(64, 1, 1)]
+void SwClear(uint3 id : SV_DispatchThreadID)
+{
+    uint n = (uint)(_SwScreen.x * _SwScreen.y);
+    if (id.x >= n) return;
+    _SwDepth[id.x] = 0;
+    _SwPayload[id.x] = 0;
+}
+
+float3 SwToScreen(float3 ws)
+{
+    float4 cp = mul(_SwVP, float4(ws, 1));
+    float3 ndc = cp.xyz / cp.w;
+    float x = (ndc.x * 0.5 + 0.5) * _SwScreen.x;
+    float y = (_SwScreen.z > 0.5 ? (1 - ndc.y) * 0.5 : ndc.y * 0.5 + 0.5) * _SwScreen.y;
+    float z = _SwScreen.w > 0.5 ? ndc.z : 1 - ndc.z;   // 近いほど大きく
+    return float3(x, y, z);
+}
+
+void SwRaster(uint3 gid, uint3 gtid, bool payload)
+{
+    uint swi = gid.x + gid.y * 65535;
+    if (swi >= min(_Stats.Load(44), _MaxVisible)) return;
+    uint2 e = _SwList[swi];
+    MeshletGpu m = _Meshlets[e.y];
+    uint tri = gtid.x;
+    if (tri >= m.triCount) return;
+    InstanceGpu I = _Instances[e.x];
+    float3 p[3];
+    [unroll] for (int k = 0; k < 3; k++)
+    {
+        uint vi = _Indices[(m.triOffset + tri) * 3 + k];
+        p[k] = SwToScreen(mul(I.m, float4(_Vertices[vi].pos, 1)).xyz);
+    }
+    float area = (p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[1].y - p[0].y) * (p[2].x - p[0].x);
+    if (area * _SwCullSign <= 1e-8) return;   // 裏向き・つぶれた三角形
+    float inv = 1.0 / area;
+    int2 lo = max((int2)floor(min(p[0].xy, min(p[1].xy, p[2].xy))), 0);
+    int2 hi = min((int2)ceil(max(p[0].xy, max(p[1].xy, p[2].xy))), (int2)_SwScreen.xy - 1);
+    hi = min(hi, lo + 31);   // 塊は小さいので 32 画素四方まで
+    uint W = (uint)_SwScreen.x;
+    for (int y = lo.y; y <= hi.y; y++)
+        for (int x = lo.x; x <= hi.x; x++)
+        {
+            float2 c = float2(x + 0.5, y + 0.5);
+            float w0 = ((p[2].x - p[1].x) * (c.y - p[1].y) - (p[2].y - p[1].y) * (c.x - p[1].x)) * inv;
+            float w1 = ((p[0].x - p[2].x) * (c.y - p[2].y) - (p[0].y - p[2].y) * (c.x - p[2].x)) * inv;
+            float w2 = 1 - w0 - w1;
+            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+            float z = w0 * p[0].z + w1 * p[1].z + w2 * p[2].z;
+            if (z <= 0) continue;
+            uint d = asuint(z);
+            uint idx = (uint)y * W + (uint)x;
+            if (!payload) InterlockedMax(_SwDepth[idx], d);
+            else if (_SwDepth[idx] == d) _SwPayload[idx] = swi * 128 + tri + 1;
+        }
+}
+
+[numthreads(128, 1, 1)]
+void SwRasterDepth(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) { SwRaster(gid, gtid, false); }
+
+[numthreads(128, 1, 1)]
+void SwRasterPayload(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) { SwRaster(gid, gtid, true); }
